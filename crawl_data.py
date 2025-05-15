@@ -128,8 +128,8 @@ def crawl_category(category, driver, driver_sub, cnt, max_retries=3):
                     time.sleep(random.uniform(2, 4))
 
                 page += 1
-                if page > 2:
-                    has_next_page = False
+                # if page > 2:
+                #     has_next_page = False
                 print(f"Số bài viết tìm thấy ở trang {page-1}: {cnt}")
                 break
 
