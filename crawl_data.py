@@ -18,7 +18,7 @@ user_agents = [
 ]
 
 categories = [
-    "kinh-doanh", "the-thao", "giai-tri", "phap-luat",
+    "thoi-su", "kinh-doanh", "the-thao", "giai-tri", "phap-luat",
     "giao-duc", "suc-khoe", "doi-song", "du-lich", "khoa-hoc",
     "so-hoa", "xe", "y-kien", "tam-su"
 ]
