@@ -1,7 +1,13 @@
+import os
 import json
 import time
 import random
-import os
+import config
+import sqlite3
+import logging
+import requests
+from queue import Queue
+from threading import Lock
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -10,27 +16,64 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-user_agents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-]
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
-categories = [
-    "thoi-su", "kinh-doanh", "the-thao", "giai-tri", "phap-luat",
-    "giao-duc", "suc-khoe", "doi-song", "du-lich", "khoa-hoc",
-    "so-hoa", "xe", "y-kien", "tam-su"
-]
+def get_db_connection(db_path="data/seen_urls.db"):
+    conn = sqlite3.connect(db_path)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS crawled_urls (
+            url TEXT PRIMARY KEY
+        )
+    ''')
+    return conn
 
-proxies_list = [
-]
+def is_url_crawled(conn, url):
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM crawled_urls WHERE url = ?", (url,))
+    return cursor.fetchone() is not None
+
+def mark_url_as_crawled(conn, url):
+    try:
+        conn.execute("INSERT OR IGNORE INTO crawled_urls (url) VALUES (?)", (url,))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Failed to insert crawled URL: {url} — {e}")
+
+user_agents = config.user_agents
+
+proxy = config.proxy
+
+max_retries = config.max_retries
+
+valid_proxy = None
+
 
 os.makedirs("data", exist_ok=True)
 
+def check_proxy(proxy):
+    try:
+        response = requests.get("http://httpbin.org/ip", proxies={"http": f"http://{proxy}", "https": f"http://{proxy}"}, timeout=5)
+        return response.status_code == 200
+    except:
+        return False
+
+
 def setup_driver():
+    """
+    Sets up a headless Chrome driver with a random user agent and optional proxy.
+
+    Returns:
+        webdriver.Chrome: The set up Chrome driver.
+    """
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")  
+    if valid_proxy:
+        chrome_options.add_argument(f'--proxy-server=http://{valid_proxy}')
     chrome_options.add_argument(f"user-agent={random.choice(user_agents)}")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
@@ -45,175 +88,244 @@ def setup_driver():
         driver.set_page_load_timeout(30)
         return driver
     except Exception as e:
-        print(f"Lỗi khi khởi tạo driver: {e}")
+        logging.error(f"Error initializing driver: {e}")
         return None
-
-def crawl_article(driver, article_url, cnt, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            driver.get(article_url)
-            WebDriverWait(driver, 30).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "fck_detail"))
-            )
-            title = driver.find_element(By.CLASS_NAME, "title-detail").text.strip()
-            category = driver.find_element(By.CLASS_NAME, "breadcrumb").find_element(By.TAG_NAME, "a").get_attribute("title").strip()
-            print("title: ", title)
-            date = driver.find_element(By.CLASS_NAME, "date").text
-            description = driver.find_element(By.CLASS_NAME, "description").text.strip() if driver.find_elements(By.CLASS_NAME, "description") else ""
-            content_elements = driver.find_elements(By.CSS_SELECTOR, "article.fck_detail p")
-            content = " ".join(elem.text.strip() for elem in content_elements if elem.text.strip())
-            cnt+=1
-            print("cnt: ", cnt)
-            return {
-                "id": cnt,
-                "title": title,
-                "category": category,
-                "date": date,
-                "description": description,
-                "content": content,
-                "url": article_url
-            }, cnt
-
-        except Exception as e:
-            print(f"Lỗi khi crawl bài viết {article_url} (lần {attempt+1}/{max_retries}): {e}")
-            if attempt == max_retries - 1:
-                return None, cnt
-            time.sleep(10)
-    return None, cnt
-
-def crawl_category(category, driver, driver_sub, cnt, max_retries=3):
-    base_url = f"https://vnexpress.net/{category}"
-    articles = []
-    page = 1
-    has_next_page = True
-
-    while has_next_page:
-        url = f"{base_url}-p{page}" if page > 1 else base_url
-        print(f"Đang crawl: {url}")
-
-        for attempt in range(max_retries):
-            try:
-                driver.get(url)
-                WebDriverWait(driver, 30).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "article.item-news, article.article-item"))
-                )
-
-                driver.execute_script("window.scrollBy(0, 500);")
-                time.sleep(2)  
-                items = driver.find_elements(By.CSS_SELECTOR, "article.item-news, article.article-item")
-
-                if not items:
-                    has_next_page = False
-                    print(f"Hết bài viết ở danh mục {category} tại trang {page}")
-                    break
-
-                for item in items:
-                    try:
-                        title_elem = item.find_elements(By.CLASS_NAME, "title-news")
-                        if not title_elem:
-                            continue
-                        article_url = item.find_element(By.CLASS_NAME, "title-news").find_element(By.TAG_NAME, "a").get_attribute("href")
-
-                        if article_url:
-                            
-                            article_data, cnt = crawl_article(driver_sub, article_url, cnt)
-                            if article_data:
-                                articles.append(article_data)
-                            else:
-                                print(f"Bỏ qua bài viết {article_url} do lỗi")
-
-                    except Exception as e:
-                        print(f"Lỗi khi xử lý bài viết: {e}")
-                        continue
-                    time.sleep(random.uniform(2, 4))
-
-                page += 1
-                # if page > 2:
-                #     has_next_page = False
-                print(f"Số bài viết tìm thấy ở trang {page-1}: {cnt}")
-                break
-
-            except Exception as e:
-                print(f"Lỗi khi crawl trang {url} (lần {attempt+1}/{max_retries}): {e}")
-                if attempt == max_retries - 1:
-                    has_next_page = False
-                    print(f"Bỏ qua trang {url} sau {max_retries} lần thử")
-                time.sleep(10)
-
-        time.sleep(random.uniform(2, 4))
-    return articles
-
-def crawl_home(driver, sub_driver, max_retries=3):
+    
+def get_categories(driver):
     base_url = "https://vnexpress.net"
-    articles = []
-
+    categories = []
+    base_delay = 2  
+    jitter = 3  
+    
     for attempt in range(max_retries):
         try:
             driver.get(base_url)
-            WebDriverWait(driver, 30).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "article.item-news, article.article-item"))
+            
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "nav.main-nav"))
+            )
+            
+            menu_items = driver.find_elements(By.CSS_SELECTOR, "nav.main-nav > ul > li > a")
+            
+            for item in menu_items:
+                category_name = item.text.strip()
+                category_url = item.get_attribute("href")
+                
+                if category_name and category_url and category_url.startswith(base_url):
+                    categories.append({
+                        "name": category_name,
+                        "url": category_url
+                    })
+            
+            unique_categories = []
+            seen_urls = set()
+            for category in categories:
+                if category["url"] not in seen_urls:
+                    unique_categories.append(category)
+                    seen_urls.add(category["url"])
+            
+            return unique_categories
+            
+        except (TimeoutException, WebDriverException) as e:
+            logging.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt == max_retries - 1:
+                logging.error("Max retries reached. Returning empty list.")
+                return []
+            delay = base_delay * (2 ** attempt) + random.uniform(0, jitter)
+            time.sleep(delay)
+            
+        except Exception as e:
+            logging.error(f"Unexpected error: {str(e)}")
+            return []
+            
+    return categories
+
+def get_article_url(driver, base_url):
+    article_urls = []
+    page = 1
+    ok = True
+    base_delay = 2  
+    jitter = 3  
+
+
+    while ok:
+        url = f"{base_url}-p{page}" if page > 1 else base_url
+        logging.info(f"Processing page {page}: {url}")
+        
+        for attempt in range(max_retries):
+            try:
+                driver.get(url)
+                
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "article.item-news"))
+                )
+                
+                articles = driver.find_elements(By.CSS_SELECTOR, "article.item-news h3.title-news a")
+                
+                for article in articles:
+                    article_url = article.get_attribute("href")
+                    if article_url and article_url.startswith("https://vnexpress.net/") and article_url not in article_urls:
+                        article_urls.append(article_url)
+                
+                page += 1
+
+                if page > 20:
+                    ok = False
+
+                break
+                
+            except (TimeoutException, WebDriverException) as e:
+                logging.warning(f"Attempt {attempt + 1} failed for page {page}: {str(e)}")
+                if attempt == max_retries - 1:
+                    logging.error(f"Max retries reached for page {page}. Skipping.")
+                    return article_urls
+                delay = base_delay * (2 ** attempt) + random.uniform(0, jitter)
+                time.sleep(delay)
+                
+            except Exception as e:
+                logging.error(f"Unexpected error on page {page}: {str(e)}")
+                return article_urls
+    
+    return article_urls
+    
+def get_all_article_url(driver, categories):
+    article_url_map = {}
+    cnt = 0
+
+    for category in categories:
+        cnt += 1
+        if cnt > 1:
+            break
+        urls = get_article_url(driver, category["url"])
+        for url in urls:
+            if url not in article_url_map:
+                article_url_map[url] = category["name"]
+
+    return list(article_url_map.items())
+
+
+
+def crawl_article(driver, article_url, category_name):
+    base_delay = 2
+    jitter = 3
+
+    for attempt in range(max_retries):
+        try:
+            logging.info(f"Crawling article: {article_url} (attempt {attempt + 1})")
+            driver.get(article_url)
+
+            article_root = WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "fck_detail"))
             )
 
-            driver.execute_script("window.scrollBy(0, 500);")
-            time.sleep(2)
-            items = driver.find_elements(By.CSS_SELECTOR, "article.item-news, article.article-item")
-            cnt = 0
+            if driver.find_elements(By.CLASS_NAME, "title-detail"):
+                title = driver.find_element(By.CLASS_NAME, "title-detail").text.strip()
+                date = driver.find_element(By.CLASS_NAME, "date").text.strip()
+                description = driver.find_element(By.CLASS_NAME, "description").text.strip() if article_root.find_elements(By.CLASS_NAME, "description") else ""
+                content = " ".join(elem.text.strip() for elem in article_root.find_elements(By.CSS_SELECTOR, "p") if elem.text.strip())
+                if content == "":
+                    break
+                logging.info(f"Successfully crawled article: {title}")
+                return {
+                    "title": title,
+                    "category": category_name,
+                    "date": date,
+                    "description": description,
+                    "content": content,
+                    "url": article_url
+                }
 
-            for item in items:
-                try:
-                    title_elem = item.find_elements(By.CLASS_NAME, "title-news")
-                    if not title_elem:
-                        continue
-                    article_url = title_elem[0].find_element(By.TAG_NAME, "a").get_attribute("href")
-                    
-                    print(f"Đang xử lý: {article_url}")
-                    if article_url:
-                        article_data, cnt = crawl_article(sub_driver, article_url, cnt)
-                        if article_data:
-                            articles.append(article_data)
-                        else:
-                            print(f"Bỏ qua bài viết {article_url} do lỗi")
+        except Exception as e:
+            delay = base_delay * (2 ** attempt) + random.uniform(0, jitter)
+            logging.warning(f"Error crawling {article_url} (attempt {attempt + 1}): {e} — Retrying after {delay:.1f}s")
+            time.sleep(delay)
 
-                except Exception as e:
-                    print(f"Lỗi khi xử lý bài viết: {e}")
-                    continue
-                time.sleep(random.uniform(2, 4))
+    logging.error(f"Failed to crawl article after {max_retries} attempts: {article_url}")
+    return None
 
-            print(f"Số bài viết tìm thấy ở trang chủ: {cnt}")
-            break
 
-        except (TimeoutException, WebDriverException) as e:
-            print(f"Lỗi khi crawl trang {base_url} (lần {attempt+1}/{max_retries}): {e}")
-            if attempt == max_retries - 1:
-                print(f"Bỏ qua trang chủ sau {max_retries} lần thử")
-            time.sleep(10)
+def crawl_all_articles_with_pool(article_url_tuples, max_workers=3, db_path="data/seen_urls.db"):
+    articles = []
+    driver_pool = Queue()
+    lock = Lock()
+    conn = get_db_connection(db_path)
 
+    new_urls = [(url, cat) for url, cat in article_url_tuples if not is_url_crawled(conn, url)]
+    logging.info(f"{len(new_urls)} new URLs to crawl (filtered from {len(article_url_tuples)})")
+
+    for _ in range(max_workers):
+        driver = setup_driver()
+        if driver:
+            driver_pool.put(driver)
+
+    def worker(url, category_name):
+        driver = driver_pool.get()
+        try:
+            article_data = crawl_article(driver, url, category_name)
+            if article_data:
+                with lock:
+                    articles.append(article_data)
+                    mark_url_as_crawled(conn, url)
+        finally:
+            driver_pool.put(driver)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(worker, url, cat) for url, cat in new_urls]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Error in crawling task: {e}")
+            time.sleep(random.uniform(1, 2))
+
+    while not driver_pool.empty():
+        driver = driver_pool.get()
+        driver.quit()
+
+    conn.close()
     return articles
 
 def save_to_json(articles, category):
     file_path = f"data/vnexpress_articles_{category}.json"
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(articles, f, ensure_ascii=False, indent=2)
-    print(f"Đã lưu {len(articles)} bài viết vào {file_path}")
+    logging.info(f"Saved {len(articles)} articles to {file_path}")
 
 def main():
+    global valid_proxy
+    if check_proxy(proxy):
+        valid_proxy = proxy
+        logging.info(f"Using proxy: {proxy}")
+    else:
+        valid_proxy = None
+        logging.warning("Proxy is not working. Proceeding without proxy.")
+
     driver = setup_driver()
-    driver_sub = setup_driver()
+    if not driver:
+        logging.error("Driver setup failed. Exiting.")
+        return
+    
+    categories = []
     try:
-        all_articles = {}
+        categories = get_categories(driver)
+        article_url_tuples = []
         for category in categories:
-            cnt = 0
-            print(f"\nBắt đầu crawl danh mục: {category}")
-            articles = crawl_category(category,driver,driver_sub, cnt)
-            all_articles[category] = articles
-            save_to_json(articles, category)
+            urls = get_article_url(driver, category["url"])
+            for url in urls:
+                article_url_tuples.append((url, category["name"]))
 
-        total_articles = [article for articles in all_articles.values() for article in articles]
-        save_to_json(total_articles, "all")
-        # crawl page home
-        # articles_page_home = crawl_home(driver, driver_sub)
-        # save_to_json(articles_page_home, "home")
+        articles = crawl_all_articles_with_pool(article_url_tuples, max_workers=5)
 
+        logging.info(f"Total articles crawled: {len(articles)}")
+        articles_by_category = {}
+        for article in articles:
+            cat = article["category"]
+            articles_by_category.setdefault(cat, []).append(article)
+
+        for cat, arts in articles_by_category.items():
+            save_to_json(arts, cat)
+        
+        save_to_json(articles, "all")
     finally:
         driver.quit()
 
