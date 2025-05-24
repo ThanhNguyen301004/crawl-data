@@ -235,7 +235,6 @@ def crawl_article(driver, article_url, category_name, max_retries=3):
                 title = article_root.find_element(By.CSS_SELECTOR, "div[data-component='headline-block']").text.strip()
                 date = article_root.find_element(By.TAG_NAME, "time").get_attribute("datetime") if article_root.find_elements(By.TAG_NAME, "time") else ""
                 description = article_root.find_element(By.CSS_SELECTOR, "div[data-component='caption-block']").text.strip() if article_root.find_elements(By.CSS_SELECTOR, "div[data-component='caption-block']") else ""
-                # print("description: ", description)
                 content = " ".join(elem.text.strip() for elem in article_root.find_elements(By.CSS_SELECTOR, "p") if elem.text.strip())
                 if content == "":
                     break
